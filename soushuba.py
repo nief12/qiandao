@@ -25,8 +25,9 @@ logger.addHandler(ch)
 
 def get_refresh_url(url: str):
     try:
-        response = requests.get(url, verify=False)
-        if response.status_code != 403:
+        logger.debug(f"获取重定向URL: {url}")
+        response = requests.get(url, verify=False, timeout=30)
+        if response.status_code != 403 and response.status_code != 200:
             response.raise_for_status()
 
         soup = BeautifulSoup(response.text, 'html.parser')
@@ -36,24 +37,41 @@ def get_refresh_url(url: str):
             content = meta_tags[0].get('content', '')
             if 'url=' in content:
                 redirect_url = content.split('url=')[1].strip()
-                print(f"Redirecting to: {redirect_url}")
+                logger.info(f"重定向到: {redirect_url}")
                 return redirect_url
         else:
-            print("No meta refresh tag found.")
+            logger.warning("未找到meta刷新标签")
             return None
     except Exception as e:
-        print(f'An unexpected error occurred: {e}')
+        logger.error(f'获取重定向URL时出错: {e}')
         return None
 
 def get_url(url: str):
-    resp = requests.get(url, verify=False)
-    soup = BeautifulSoup(resp.content, 'html.parser')
+    try:
+        logger.debug(f"解析搜书吧链接: {url}")
+        resp = requests.get(url, verify=False, timeout=30)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.content, 'html.parser')
 
-    links = soup.find_all('a', href=True)
-    for link in links:
-        if link.text == "搜书吧":
-            return link['href']
-    return None
+        # 查找所有可能的链接模式
+        possible_links = soup.find_all('a', href=True)
+        for link in possible_links:
+            if "搜书吧" in link.text.strip():
+                logger.info(f"找到搜书吧链接: {link['href']}")
+                return link['href']
+        
+        # 备用搜索方式
+        for link in possible_links:
+            if "soushu" in link['href'].lower() or "shu" in link['href'].lower():
+                logger.info(f"通过URL模式找到链接: {link['href']}")
+                return link['href']
+                
+        logger.warning("未找到搜书吧链接")
+        logger.debug(f"页面标题: {soup.title.string if soup.title else '无标题'}")
+        return None
+    except Exception as e:
+        logger.error(f'解析搜书吧链接时出错: {e}')
+        return None
 
 class SouShuBaClient:
 
@@ -69,100 +87,175 @@ class SouShuBaClient:
             "Host": f"{ hostname }",
             "Connection": "keep-alive",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
             "Accept-Language": "zh-CN,cn;q=0.9",
             "Content-Type": "application/x-www-form-urlencoded",
         }
         self.proxies = proxies
+        # 添加重试机制
+        self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=3))
 
     def login_form_hash(self):
-        rst = self.session.get(f'https://{self.hostname}/member.php?mod=logging&action=login', verify=False).text
-        loginhash = re.search(r'<div id="main_messaqge_(.+?)">', rst).group(1)
-        formhash = re.search(r'<input type="hidden" name="formhash" value="(.+?)" />', rst).group(1)
-        return loginhash, formhash
+        try:
+            logger.debug("获取登录表单哈希")
+            url = f'https://{self.hostname}/member.php?mod=logging&action=login'
+            response = self.session.get(url, verify=False, timeout=30)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # 查找loginhash
+            loginhash_div = soup.find('div', id=re.compile(r'main_messaqge_'))
+            if loginhash_div:
+                loginhash = loginhash_div['id'].split('_')[-1]
+            else:
+                loginhash = ""
+                logger.warning("未找到loginhash，使用空值")
+            
+            # 查找formhash
+            formhash_input = soup.find('input', {'name': 'formhash'})
+            if formhash_input and formhash_input.get('value'):
+                formhash = formhash_input['value']
+            else:
+                # 备选方案
+                for selector in ['input[name="formhash"]', 'input[name^="formhash"]']:
+                    element = soup.select_one(selector)
+                    if element and element.get('value'):
+                        formhash = element.get('value')
+                        break
+                else:
+                    logger.error("未找到formhash")
+                    raise ValueError("无法获取登录表单的formhash")
+            
+            logger.debug(f"获取到loginhash: {loginhash}, formhash: {formhash}")
+            return loginhash, formhash
+        except Exception as e:
+            logger.exception("获取登录表单哈希时出错")
+            raise
 
     def login(self):
         """Login with username and password"""
-        loginhash, formhash = self.login_form_hash()
-        login_url = f'https://{self.hostname}/member.php?mod=logging&action=login&loginsubmit=yes' \
-                    f'&handlekey=register&loginhash={loginhash}&inajax=1'
+        try:
+            loginhash, formhash = self.login_form_hash()
+            login_url = f'https://{self.hostname}/member.php?mod=logging&action=login&loginsubmit=yes' \
+                        f'&handlekey=register&loginhash={loginhash}&inajax=1'
 
+            headers = copy(self._common_headers)
+            headers["origin"] = f'https://{self.hostname}'
+            headers["referer"] = f'https://{self.hostname}/member.php?mod=logging&action=login'
+            
+            payload = {
+                'formhash': formhash,
+                'referer': f'https://{self.hostname}/',
+                'username': self.username,
+                'password': self.password,
+                'questionid': self.questionid,
+                'answer': self.answer
+            }
 
-        headers = copy(self._common_headers)
-        headers["origin"] = f'https://{self.hostname}'
-        headers["referer"] = f'https://{self.hostname}/'
-        payload = {
-            'formhash': formhash,
-            'referer': f'https://{self.hostname}/',
-            'username': self.username,
-            'password': self.password,
-            'questionid': self.questionid,
-            'answer': self.answer
-        }
-
-        resp = self.session.post(login_url, proxies=self.proxies, data=payload, headers=headers, verify=False)
-        if resp.status_code == 200:
-            logger.info(f'Welcome {self.username}!')
-        else:
-            raise ValueError('Verify Failed! Check your username and password!')
+            logger.debug(f"登录请求: {login_url}")
+            resp = self.session.post(login_url, proxies=self.proxies, data=payload, headers=headers, 
+                                    verify=False, timeout=30)
+            
+            # 检查登录是否成功
+            if resp.status_code == 200:
+                success_patterns = [
+                    f'欢迎您回来，{self.username}',
+                    '登录成功',
+                    '现在将转入登录前页面',
+                    '登录成功'
+                ]
+                
+                if any(pattern in resp.text for pattern in success_patterns):
+                    logger.info(f'欢迎 {self.username}! 登录成功')
+                else:
+                    logger.error("登录失败: 响应中未找到成功标识")
+                    logger.debug(f"登录响应内容: {resp.text[:500]}...")
+                    raise ValueError('登录失败，请检查用户名和密码!')
+            else:
+                logger.error(f"登录请求失败，状态码: {resp.status_code}")
+                resp.raise_for_status()
+                
+        except Exception as e:
+            logger.exception("登录过程中出错")
+            raise
 
     def credit(self):
-        credit_url = f"https://{self.hostname}/home.php?mod=spacecp&ac=credit&showcredit=1&inajax=1&ajaxtarget=extcreditmenu_menu"
-        credit_rst = self.session.get(credit_url, verify=False).text
+        try:
+            credit_url = f"https://{self.hostname}/home.php?mod=spacecp&ac=credit&showcredit=1&inajax=1&ajaxtarget=extcreditmenu_menu"
+            logger.debug(f"获取积分信息: {credit_url}")
+            credit_rst = self.session.get(credit_url, verify=False, timeout=30).text
 
-        # 解析 XML，提取 CDATA
-        root = ET.fromstring(str(credit_rst))
-        cdata_content = root.text
+            # 解析 XML，提取 CDATA
+            root = ET.fromstring(credit_rst)
+            cdata_content = root.text
 
-        # 使用 BeautifulSoup 解析 CDATA 内容
-        cdata_soup = BeautifulSoup(cdata_content, features="lxml")
-        hcredit_2 = cdata_soup.find("span", id="hcredit_2").string
-
-        return hcredit_2
+            # 使用 BeautifulSoup 解析 CDATA 内容
+            cdata_soup = BeautifulSoup(cdata_content, "html.parser")
+            hcredit_2 = cdata_soup.find("span", id="hcredit_2")
+            
+            if hcredit_2 and hcredit_2.string:
+                return hcredit_2.string.strip()
+            else:
+                logger.warning("未找到积分信息")
+                return "未知"
+        except Exception as e:
+            logger.error(f"获取积分时出错: {e}")
+            return "获取失败"
 
     def space_form_hash(self):
-        rst = self.session.get(f'https://{self.hostname}/home.php', verify=False).text
-        formhash = re.search(r'<input type="hidden" name="formhash" value="(.+?)" />', rst).group(1)
-        return formhash
+        try:
+            url = f'https://{self.hostname}/home.php'
+            logger.debug(f"访问主页获取formhash: {url}")
+            response = self.session.get(url, verify=False, timeout=30)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # 尝试多种方式查找formhash
+            formhash_input = soup.find('input', {'name': 'formhash'})
+            if formhash_input:
+                formhash = formhash_input.get('value')
+                if formhash:
+                    logger.debug(f"找到formhash: {formhash}")
+                    return formhash
+            
+            # 备选选择器
+            for selector in ['input[name="formhash"]', 'input[name^="formhash"]']:
+                element = soup.select_one(selector)
+                if element and element.get('value'):
+                    formhash = element.get('value')
+                    logger.debug(f"通过选择器 '{selector}' 找到formhash: {formhash}")
+                    return formhash
+            
+            # 记录HTML片段用于调试
+            logger.error("无法在页面中找到formhash")
+            logger.debug(f"页面标题: {soup.title.string if soup.title else '无标题'}")
+            logger.debug(f"HTML片段: {response.text[:1000]}")
+            raise ValueError("无法获取formhash")
+        except Exception as e:
+            logger.exception(f"获取formhash时发生错误: {e}")
+            raise
 
     def space(self):
-        formhash = self.space_form_hash()
-        space_url = f"https://{self.hostname}/home.php?mod=spacecp&ac=doing&handlekey=doing&inajax=1"
+        try:
+            formhash = self.space_form_hash()
+            space_url = f"https://{self.hostname}/home.php?mod=spacecp&ac=doing&handlekey=doing&inajax=1"
+            logger.info(f"准备发布空间动态，formhash: {formhash}")
 
-        headers = copy(self._common_headers)
-        headers["origin"] = f'https://{self.hostname}'
-        headers["referer"] = f'https://{self.hostname}/home.php'
+            headers = copy(self._common_headers)
+            headers["origin"] = f'https://{self.hostname}'
+            headers["referer"] = f'https://{self.hostname}/home.php'
 
-        for x in range(5):
-            payload = {
-                "message": "开心赚银币 {0} 次".format(x + 1).encode("GBK"),
-                "addsubmit": "true",
-                "spacenote": "true",
-                "referer": "home.php",
-                "formhash": formhash
-            }
-            resp = self.session.post(space_url, proxies=self.proxies, data=payload, headers=headers, verify=False)
-            if re.search("操作成功", resp.text):
-                logger.info(f'{self.username} post {x + 1}nd successfully!')
-                time.sleep(120)
-            else:
-                logger.warning(f'{self.username} post {x + 1}nd failed!')
-
-
-if __name__ == '__main__':
-    try:
-        redirect_url = get_refresh_url('http://' + os.environ.get('SOUSHUBA_HOSTNAME', 'www.soushu2025.com'))
-        time.sleep(2)
-        redirect_url2 = get_refresh_url(redirect_url)
-        url = get_url(redirect_url2)
-        logger.info(f'{url}')
-        client = SouShuBaClient(urlparse(url).hostname,
-                                os.environ.get('SOUSHUBA_USERNAME', "libesse"),
-                                os.environ.get('SOUSHUBA_PASSWORD', "yF9pnSBLH3wpnLd"))
-        client.login()
-        client.space()
-        credit = client.credit()
-        logger.info(f'{client.username} have {credit} coins!')
-    except Exception as e:
-        logger.error(e)
-        sys.exit(1)
+            success_count = 0
+            for x in range(5):
+                try:
+                    message = f"开心赚银币 {x + 1} 次"
+                    payload = {
+                        "message": message.encode("GBK"),
+                        "addsubmit": "true",
+                        "spacenote": "true",
+                        "referer": "home.php",
+                        "formhash": formhash
+                    }
+         
