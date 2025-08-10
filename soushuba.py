@@ -258,4 +258,94 @@ class SouShuBaClient:
                         "referer": "home.php",
                         "formhash": formhash
                     }
-         
+                    
+                    logger.debug(f"发布动态 {x+1}: {message}")
+                    resp = self.session.post(space_url, proxies=self.proxies, data=payload, 
+                                            headers=headers, verify=False, timeout=30)
+                    
+                    if resp.status_code == 200 and "操作成功" in resp.text:
+                        logger.info(f'{self.username} 第 {x + 1} 次发布成功!')
+                        success_count += 1
+                    else:
+                        logger.warning(f'{self.username} 第 {x + 1} 次发布失败! 响应: {resp.status_code}')
+                        logger.debug(f"失败响应内容: {resp.text[:200]}...")
+                    
+                    # 即使失败也等待
+                    if x < 4:
+                        logger.info("等待120秒后进行下一次发布...")
+                        time.sleep(120)
+                        
+                except Exception as e:
+                    logger.error(f"第 {x+1} 次发布时出错: {e}")
+            
+            return success_count
+        except Exception as e:
+            logger.exception("发布空间动态时出错")
+            return 0
+
+
+if __name__ == '__main__':
+    try:
+        logger.info("="*50)
+        logger.info("搜书吧自动任务开始")
+        logger.info("="*50)
+        
+        # 第一步：获取初始重定向
+        initial_url = 'http://' + os.environ.get('SOUSHUBA_HOSTNAME', 'www.soushu2025.com')
+        logger.info(f"初始URL: {initial_url}")
+        redirect_url = get_refresh_url(initial_url)
+        
+        if not redirect_url:
+            logger.error("未获取到重定向URL，退出")
+            sys.exit(1)
+        
+        # 第二步：获取第二次重定向
+        time.sleep(2)
+        logger.info(f"第二级重定向URL: {redirect_url}")
+        redirect_url2 = get_refresh_url(redirect_url)
+        
+        if not redirect_url2:
+            logger.error("未获取到第二级重定向URL，退出")
+            sys.exit(1)
+        
+        # 第三步：解析搜书吧真实URL
+        time.sleep(2)
+        logger.info(f"解析真实URL: {redirect_url2}")
+        url = get_url(redirect_url2)
+        
+        if not url:
+            logger.error("未找到搜书吧链接，退出")
+            sys.exit(1)
+        
+        # 解析主机名
+        parsed_url = urlparse(url)
+        hostname = parsed_url.hostname
+        logger.info(f"解析到主机名: {hostname}")
+        
+        # 创建客户端
+        client = SouShuBaClient(
+            hostname,
+            os.environ.get('SOUSHUBA_USERNAME', "libesse"),
+            os.environ.get('SOUSHUBA_PASSWORD', "yF9pnSBLH3wpnLd")
+        )
+        
+        # 登录
+        client.login()
+        
+        # 发布动态
+        success_count = client.space()
+        
+        # 查询积分
+        credit = client.credit()
+        logger.info(f"{client.username} 成功发布 {success_count} 条动态，当前积分: {credit}")
+        
+        if success_count < 3:
+            logger.warning("成功发布动态少于3条，可能存在问题")
+            sys.exit(1)
+        else:
+            logger.info("任务执行成功")
+            sys.exit(0)
+            
+    except Exception as e:
+        logger.exception("主程序运行出错")
+        sys.exit(1)
